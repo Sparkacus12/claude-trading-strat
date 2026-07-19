@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-EDGAR_UA = "nowcast-research your.email@example.com"  # <-- PUT YOUR EMAIL
+EDGAR_UA = "nowcast-research jonpsparks@gmail.com"  # <-- PUT YOUR EMAIL
 
 FRED_SERIES = {
     "cfnai": "CFNAI", "indpro": "INDPRO", "payrolls": "PAYEMS",
