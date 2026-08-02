@@ -6,4 +6,6 @@ scipy
 requests
 lxml
 yfinance
+pandas-datareader
+
 
