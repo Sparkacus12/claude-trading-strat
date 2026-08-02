@@ -1,16 +1,30 @@
 """
-Generate macro_cache.csv for the repo.
+Generate macro_cache.csv for the repo - v3, using the REAL FRED API.
 
-v2 fix: FRED requests need a normal BROWSER User-Agent, or they hang/timeout
-from cloud IPs (GitHub Actions runners included) - this is the same fix
-already applied to free_data_adapter.py. Timeout is also short (8s) so a
-genuine failure fails fast instead of the whole run taking 5+ minutes.
+Why this version exists: the previous "fredgraph.csv" endpoint is a
+browser-export tool, not a proper API - and FRED blocks that endpoint from
+well-known cloud/CI IP ranges (including GitHub Actions runners) as an
+anti-scraping measure. No amount of User-Agent tweaking fixes an IP block.
+
+The FIX: use FRED's official Observations API (api.stlouisfed.org), which
+requires a free API key. Key-authenticated traffic is treated as legitimate
+programmatic access and isn't subject to the same IP-range blocking.
+
+Get a free key: fred.stlouisfed.org -> create account -> My Account ->
+API Keys (instant, free).
+
+The key is read from the FRED_API_KEY environment variable - NOT hardcoded
+here. In GitHub Actions, set it as a repo secret (Settings > Secrets and
+variables > Actions > New repository secret, name FRED_API_KEY) and the
+workflow passes it in as an env var.
 
 Run via the GitHub Actions workflow (Run Workflow button), or locally:
+    export FRED_API_KEY=your_key_here
     pip install pandas requests
     python3 refresh_macro_cache.py
 """
-import io
+import os
+import sys
 
 import numpy as np
 import pandas as pd
@@ -24,43 +38,54 @@ FRED_SERIES = {
 }
 
 START = "1990-01-01"
-
-# Normal browser UA - FRED (and most public data sites) will hang or refuse
-# requests from generic/script-like User-Agents, especially from cloud IPs.
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+API_KEY = os.environ.get("FRED_API_KEY", "").strip()
 
 
 def fetch(code, session):
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
-    r = session.get(url, timeout=8)  # short timeout: fail fast, not fail slow
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": code,
+        "api_key": API_KEY,
+        "file_type": "json",
+        "observation_start": START,
+    }
+    r = session.get(url, params=params, timeout=15)
     r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text)).iloc[:, :2]
-    df.columns = ["date", "val"]
+    data = r.json()
+    obs = data.get("observations", [])
+    if not obs:
+        return None
+    df = pd.DataFrame(obs)[["date", "value"]]
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["val"] = pd.to_numeric(df["val"].replace(".", np.nan), errors="coerce")
-    return df.dropna().set_index("date")["val"]
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")  # FRED uses "." for missing
+    return df.dropna().set_index("date")["value"]
 
 
 def main():
-    session = requests.Session()
-    session.headers.update({"User-Agent": UA})
+    if not API_KEY:
+        print("ERROR: FRED_API_KEY environment variable is not set.")
+        print("Get a free key at fred.stlouisfed.org (My Account > API Keys),")
+        print("then add it as a GitHub Actions secret named FRED_API_KEY,")
+        print("or `export FRED_API_KEY=...` before running locally.")
+        sys.exit(1)
 
+    session = requests.Session()
     out, failed = {}, []
     for name, code in FRED_SERIES.items():
         try:
             s = fetch(code, session)
+            if s is None or len(s) == 0:
+                raise ValueError("empty response")
             out[name] = s
             print(f"  {name:16s} ({code:12s}) {len(s):6d} obs")
         except Exception as ex:
             failed.append(code)
-            print(f"  {name:16s} ({code:12s}) FAILED: {type(ex).__name__}")
+            print(f"  {name:16s} ({code:12s}) FAILED: {type(ex).__name__}: {ex}")
 
     if not out:
-        print("\nNothing fetched. If every series failed with ReadTimeout/"
-              "403, FRED may be temporarily blocking this runner's IP - "
-              "try again in a few minutes, or run this locally on your Mac.")
-        raise SystemExit(1)  # non-zero exit -> Actions shows red X, not a silent green pass
+        print("\nNothing fetched. Check the API key is correct and active "
+              "(new keys can take a minute to activate).")
+        sys.exit(1)
 
     panel = (pd.DataFrame(out).sort_index().loc[START:]
              .resample("ME").last().ffill())
