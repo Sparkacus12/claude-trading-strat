@@ -1,0 +1,19 @@
+name: Refresh macro cache
+
+on:
+  workflow_dispatch:   # lets you trigger it manually from the Actions tab
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas requests
+      - run: python3 refresh_macro_cache.py
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Refresh macro cache"
+          file_pattern: macro_cache.csv
