@@ -13,6 +13,8 @@ jobs:
           python-version: "3.11"
       - run: pip install pandas requests
       - run: python3 refresh_macro_cache.py
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
       - uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Refresh macro cache"
