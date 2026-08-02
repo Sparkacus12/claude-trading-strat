@@ -239,6 +239,26 @@ class FreeDataAdapter:
 
     # ---- macro (FRED) ---------------------------------------------------
     def get_macro_panel(self, start, end) -> pd.DataFrame:
+        """
+        Prefers a LOCAL cached CSV (macro_cache.csv in the repo). Live FRED
+        calls are slow and often blocked from cloud IPs - 11 series x several
+        endpoints x 30s timeouts can hang for minutes, and that cost does NOT
+        shrink when you reduce the universe size.
+
+        Macro data is monthly, so a cached file is perfectly adequate; refresh
+        it occasionally by running refresh_macro_cache.py locally.
+        """
+        # 1. local cache first (instant)
+        try:
+            df = pd.read_csv("macro_cache.csv", parse_dates=["date"]).set_index("date")
+            df = df.loc[str(start.date()):str(end.date())]
+            if len(df) >= 24:
+                self.diagnostics["macro"] = f"OK: {df.shape[1]} series from local cache ({len(df)} months)"
+                return df.sort_index()
+        except Exception:
+            pass
+
+        # 2. live FRED, fast-failing
         out, failed = {}, []
         for name, code in FRED_SERIES.items():
             s = self._fred_one(code, start, end)
@@ -248,31 +268,29 @@ class FreeDataAdapter:
                 failed.append(code)
             time.sleep(self._sleep)
         if not out:
-            self.diagnostics["macro"] = f"FAIL: all {len(FRED_SERIES)} FRED series empty"
+            self.diagnostics["macro"] = (
+                f"FAIL: no local macro_cache.csv and all {len(FRED_SERIES)} "
+                f"live FRED series empty")
             return pd.DataFrame()
         self.diagnostics["macro"] = (
-            f"OK: {len(out)}/{len(FRED_SERIES)} series"
+            f"OK: {len(out)}/{len(FRED_SERIES)} live FRED series"
             + (f" (missing: {', '.join(failed)})" if failed else ""))
         return pd.DataFrame(out).sort_index().resample("ME").last().ffill()
 
     def _fred_one(self, code, start, end):
         """
-        Try multiple FRED access methods. The classic fredgraph.csv endpoint
-        has become unreliable from cloud IPs; the stlouisfed 'fredgraph.csv'
-        with explicit params and a couple of alternates are tried in order.
+        Try FRED endpoints in order, with SHORT timeouts so failures fail fast
+        rather than hanging the app.
         """
         s = str(start.date())
         e = str(end.date())
         urls = [
-            # explicit date params sometimes succeed where the bare id fails
             f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}&cosd={s}&coed={e}",
             f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}",
-            # stlouisfed FRED download alternate host
-            f"https://fred.stlouisfed.org/data/{code}.csv",
         ]
         for url in urls:
             try:
-                r = self._pub.get(url, timeout=30)
+                r = self._pub.get(url, timeout=8)   # short timeout
                 if r.status_code != 200 or "," not in r.text[:200]:
                     continue
                 df = pd.read_csv(io.StringIO(r.text))
@@ -282,13 +300,11 @@ class FreeDataAdapter:
                 df.columns = ["date", "val"]
                 df["date"] = pd.to_datetime(df["date"], errors="coerce")
                 df["val"] = pd.to_numeric(df["val"].replace(".", np.nan), errors="coerce")
-                out = df.dropna().set_index("date")["val"]
-                out = out.loc[s:e]
+                out = df.dropna().set_index("date")["val"].loc[s:e]
                 if len(out):
                     return out
             except Exception:
                 continue
-        # last resort: pandas-datareader if installed
         try:
             import pandas_datareader.data as web
             out = web.DataReader(code, "fred", start, end)[code].dropna()
