@@ -1,178 +1,158 @@
 """
-Free-data adapter: EDGAR (earnings) + FRED (macro) + stooq (prices).
-No API keys, no licensed data. Runs anywhere with internet - including
-Streamlit Community Cloud.
+Streamlit front-end for the free-data strategy.
 
-SET YOUR EMAIL in EDGAR_UA below: SEC's fair-access policy requires a real
-contact in the User-Agent or they may block requests.
+v2: adds a DIAGNOSTICS panel that reports what each data source returned,
+so a failure tells you WHICH source failed instead of a generic message.
 """
-from __future__ import annotations
-
-import io
-import time
-
 import numpy as np
 import pandas as pd
-import requests
+import streamlit as st
 
-EDGAR_UA = "nowcast-research jonpsparks@gmail.com"  # <-- PUT YOUR EMAIL
+from free_data_adapter import FreeDataAdapter
+import engine as e
 
-FRED_SERIES = {
-    "cfnai": "CFNAI", "indpro": "INDPRO", "payrolls": "PAYEMS",
-    "unemployment": "UNRATE", "retail_sales": "RSAFS", "core_cpi": "CPILFESL",
-    "ten_year": "DGS10", "two_year": "DGS2", "baa_spread": "BAA10Y",
-    "hy_spread": "BAMLH0A0HYM2", "fin_conditions": "NFCI",
-}
+st.set_page_config(page_title="NOWCAST free-data strategy", layout="wide")
+st.title("NOWCAST earnings-revision strategy (free data)")
+st.caption("Macro-nowcast × earnings-beta signal (Carabias 2018), plus momentum, "
+           "trend and a macro regime read. EDGAR + FRED + stooq/yfinance. "
+           "Research only — not investment advice.")
+
+# ----------------------------------------------------------------------
+# Sidebar
+# ----------------------------------------------------------------------
+st.sidebar.header("Settings")
+universe_cap = st.sidebar.slider("Universe size (names)", 10, 200, 30, 10,
+                                 help="Start small; free data pulls are slow.")
+hist_years = st.sidebar.slider("Earnings history (years)", 4, 12, 8, 1)
+top_n = st.sidebar.slider("Show top N", 5, 30, 10, 5)
+run = st.sidebar.button("Run / refresh data")
+st.sidebar.markdown("---")
+st.sidebar.caption("First run pulls and caches data (slow). Later loads use cache.")
 
 
-class FreeDataAdapter:
-    def __init__(self, ua: str = EDGAR_UA, polite_sleep: float = 0.12):
-        self._sleep = polite_sleep
-        self._sess = requests.Session()
-        self._sess.headers.update({"User-Agent": ua})
-        self._cik_map = None
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def load_and_compute(universe_cap: int, hist_years: int):
+    a = FreeDataAdapter()
+    end = pd.Timestamp.today()
+    start_px = end - pd.DateOffset(years=2)
+    start_hist = end - pd.DateOffset(years=hist_years)
 
-    # ---- universe -------------------------------------------------------
-    def get_universe(self, as_of=None) -> list[str]:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        html = self._sess.get(url, timeout=30).text
-        table = pd.read_html(io.StringIO(html))[0]
-        return table["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
+    res = {}
+    tickers = a.get_universe()[:universe_cap]
+    prices = a.get_prices(tickers, start_px, end)
+    macro = a.get_macro_panel(start_hist, end)
+    earnings = a.get_earnings(tickers, start_hist, end, prices=prices)
 
-    # ---- prices (stooq) -------------------------------------------------
-    def get_prices(self, tickers, start, end) -> pd.DataFrame:
-        out = {}
-        for t in tickers:
-            s = self._stooq_one(t, start, end)
-            if s is not None and len(s):
-                out[t] = s
-            time.sleep(self._sleep)
-        if not out:
-            return pd.DataFrame()
-        px = pd.DataFrame(out).sort_index()
-        return px.loc[str(start.date()):str(end.date())].ffill()
+    res["diagnostics"] = dict(a.diagnostics)
+    res["n_tickers"] = len(tickers)
+    res["prices_shape"] = tuple(prices.shape)
+    res["n_earnings"] = len(earnings)
 
-    def _stooq_one(self, ticker, start, end):
-        sym = ticker.lower() + ".us"
-        url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-        try:
-            r = self._sess.get(url, timeout=30)
-            if r.status_code != 200 or "Date" not in r.text[:50]:
-                return None
-            df = pd.read_csv(io.StringIO(r.text), parse_dates=["Date"]).set_index("Date")
-            return df["Close"].rename(ticker)
-        except Exception:
-            return None
+    if macro.empty:
+        res["fatal"] = "FRED macro pull returned nothing — the business-cycle factor can't be built."
+        return res
+    if prices.empty:
+        res["fatal"] = "Price pull returned nothing — momentum/trend can't be built."
+        return res
 
-    # ---- earnings (EDGAR) ----------------------------------------------
-    def _load_cik_map(self):
-        if self._cik_map is not None:
-            return
-        url = "https://www.sec.gov/files/company_tickers.json"
-        data = self._sess.get(url, timeout=30).json()
-        self._cik_map = {
-            v["ticker"].upper().replace(".", "-"): str(v["cik_str"]).zfill(10)
-            for v in data.values()
-        }
+    bc = e.build_business_cycle_factor(macro)
+    bc_q = e.factor_quarterly(bc)
+    res["bc_series"] = bc
+    res["bc_latest"] = float(bc.dropna().iloc[-1]) if len(bc.dropna()) else np.nan
+    res["regime"] = e.regime_score(macro)
 
-    def get_earnings(self, tickers, start, end) -> pd.DataFrame:
-        self._load_cik_map()
-        prices = self.get_prices(tickers, start, end)
-        rows = []
-        for t in tickers:
-            cik = self._cik_map.get(t.upper())
-            if not cik:
-                continue
-            facts = self._companyfacts(cik)
-            if facts is None:
-                continue
-            for rec in self._extract_eps(facts):
-                if not (start <= rec["end"] <= end):
-                    continue
-                rows.append({
-                    "ticker": t,
-                    "fiscal_period_end": rec["end"],
-                    "announcement_date": rec["filed"],
-                    "eps_actual": rec["val"],
-                    "eps_consensus": np.nan,
-                    "price_at_period_end": self._price_at(prices, t, rec["end"]),
-                })
-            time.sleep(self._sleep)
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-        return (df.sort_values("announcement_date")
-                  .groupby(["ticker", "fiscal_period_end"]).tail(1)
-                  .sort_values(["ticker", "fiscal_period_end"]).reset_index(drop=True))
+    as_of = prices.index.max()
+    if not earnings.empty:
+        sue = e.compute_sue(earnings)
+        betas = e.estimate_earnings_betas(sue, bc_q)
+        res["n_betas"] = 0 if betas.empty else betas["ticker"].nunique()
+        res["nowcast"] = e.compute_nowcast(betas, bc_q, as_of) if not betas.empty else pd.DataFrame()
+    else:
+        res["n_betas"] = 0
+        res["nowcast"] = pd.DataFrame()
 
-    def _companyfacts(self, cik):
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        try:
-            r = self._sess.get(url, timeout=30)
-            return r.json() if r.status_code == 200 else None
-        except Exception:
-            return None
+    res["momentum"] = e.momentum_score(prices, as_of)
+    res["trend"] = e.trend_quality(prices, as_of)
+    return res
 
-    @staticmethod
-    def _extract_eps(facts):
-        out = []
-        try:
-            gaap = facts["facts"]["us-gaap"]
-        except KeyError:
-            return out
-        for tag in ["EarningsPerShareDiluted", "EarningsPerShareBasic"]:
-            if tag not in gaap:
-                continue
-            for unit, recs in gaap[tag]["units"].items():
-                for rec in recs:
-                    if rec.get("form") not in ("10-Q", "10-K"):
-                        continue
-                    if not all(k in rec for k in ("end", "filed", "val")):
-                        continue
-                    try:
-                        end_d = pd.Timestamp(rec["end"])
-                        start_d = pd.Timestamp(rec["start"]) if "start" in rec else None
-                    except Exception:
-                        continue
-                    if start_d is not None and (end_d - start_d).days > 100:
-                        continue  # drop annual/ytd aggregates
-                    out.append({"end": end_d, "filed": pd.Timestamp(rec["filed"]),
-                                "val": float(rec["val"])})
-            if out:
-                break
-        seen = {}
-        for r in sorted(out, key=lambda x: x["filed"]):
-            seen[r["end"]] = r
-        return list(seen.values())
 
-    @staticmethod
-    def _price_at(prices, ticker, dt):
-        if ticker not in prices.columns:
-            return np.nan
-        s = prices[ticker].loc[:dt].dropna()
-        return float(s.iloc[-1]) if len(s) else np.nan
+if not run:
+    st.info("Set the universe size in the sidebar and click **Run / refresh data**. "
+            "Start small (~30 names) to confirm it works.")
+    st.stop()
 
-    # ---- macro (FRED) ---------------------------------------------------
-    def get_macro_panel(self, start, end) -> pd.DataFrame:
-        out = {}
-        for name, code in FRED_SERIES.items():
-            s = self._fred_one(code, start, end)
-            if s is not None and len(s):
-                out[name] = s
-            time.sleep(self._sleep)
-        if not out:
-            return pd.DataFrame()
-        return pd.DataFrame(out).sort_index().resample("ME").last().ffill()
+with st.spinner("Pulling free data and computing (cached after first run)…"):
+    res = load_and_compute(universe_cap, hist_years)
 
-    def _fred_one(self, code, start, end):
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
-        try:
-            r = self._sess.get(url, timeout=30)
-            df = pd.read_csv(io.StringIO(r.text))
-            df.columns = ["date", "val"]
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df["val"] = pd.to_numeric(df["val"].replace(".", np.nan), errors="coerce")
-            df = df.dropna().set_index("date")["val"]
-            return df.loc[str(start.date()):str(end.date())]
-        except Exception:
-            return None
+# ---- diagnostics (always visible) ------------------------------------
+with st.expander("Data diagnostics — open this if something looks wrong", expanded=bool(res.get("fatal"))):
+    d = res.get("diagnostics", {})
+    for k in ["universe", "prices", "macro", "earnings"]:
+        v = d.get(k, "not run")
+        icon = "✅" if v.startswith("OK") else "⚠️"
+        st.write(f"{icon} **{k}** — {v}")
+    st.write(f"• tickers requested: {res.get('n_tickers')} | "
+             f"price frame: {res.get('prices_shape')} | "
+             f"earnings rows: {res.get('n_earnings')} | "
+             f"names with betas: {res.get('n_betas', 'n/a')}")
+
+if res.get("fatal"):
+    st.error(res["fatal"])
+    st.stop()
+
+# ---- headline --------------------------------------------------------
+reg = res.get("regime", {})
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Business-cycle factor", f"{res.get('bc_latest', float('nan')):.2f}")
+c2.metric("Regime", reg.get("regime", "n/a"))
+c3.metric("Risk-on score", f"{reg.get('risk_on_score', float('nan')):.2f}")
+c4.metric("Names / earnings rows", f"{res['prices_shape'][1]} / {res['n_earnings']}")
+
+st.markdown("### Business-cycle factor")
+if "bc_series" in res and len(res["bc_series"].dropna()):
+    st.line_chart(res["bc_series"].dropna())
+
+# ---- NOWCAST ---------------------------------------------------------
+st.markdown("### NOWCAST signal (macro-nowcast × earnings-beta)")
+nc = res.get("nowcast", pd.DataFrame())
+if nc.empty:
+    st.warning("No NOWCAST signals yet — not enough earnings history for these names. "
+               "Raise 'Earnings history (years)' or the universe size.")
+else:
+    bc_now = nc["bc_now"].iloc[0]
+    st.caption(
+        f"Current cycle nowcast = {bc_now:+.2f}. "
+        + ("Positive: high earnings-beta (cyclical) names rank top."
+           if bc_now > 0 else
+           "Negative: low/defensive-beta names rank top — the model favours "
+           "low cyclicality into a softening cycle. This is expected behaviour, not a bug.")
+    )
+    cL, cR = st.columns(2)
+    cL.markdown("**Top (long candidates)**")
+    cL.dataframe(nc.head(top_n)[["ticker", "beta_hat", "nowcast", "decile"]],
+                 use_container_width=True)
+    cR.markdown("**Bottom (avoid / short candidates)**")
+    cR.dataframe(nc.tail(top_n)[["ticker", "beta_hat", "nowcast", "decile"]].iloc[::-1],
+                 use_container_width=True)
+
+# ---- momentum --------------------------------------------------------
+st.markdown("### 12-1 Momentum")
+mom = res.get("momentum", pd.DataFrame())
+if mom.empty:
+    st.info("Momentum needs ~13 months of prices; not enough history yet.")
+else:
+    st.dataframe(mom.head(top_n)[["ticker", "mom_score", "mom_decile"]],
+                 use_container_width=True)
+
+# ---- trend -----------------------------------------------------------
+st.markdown("### Clean uptrends (trend-quality filter)")
+tr = res.get("trend", pd.DataFrame())
+if not tr.empty:
+    clean = tr[tr["clean_trend"]].sort_values("trend_score", ascending=False)
+    st.caption(f"{len(clean)} of {len(tr)} names in statistically clean uptrends.")
+    st.dataframe(clean.head(top_n)[["ticker", "trend_t", "trend_score"]],
+                 use_container_width=True)
+
+st.markdown("---")
+st.caption("Free-data version: EDGAR earnings (no analyst consensus), FRED macro, "
+           "stooq/yfinance prices. Survivorship-approximate. Model output, not advice.")
