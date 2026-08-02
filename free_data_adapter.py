@@ -256,19 +256,42 @@ class FreeDataAdapter:
         return pd.DataFrame(out).sort_index().resample("ME").last().ffill()
 
     def _fred_one(self, code, start, end):
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
+        """
+        Try multiple FRED access methods. The classic fredgraph.csv endpoint
+        has become unreliable from cloud IPs; the stlouisfed 'fredgraph.csv'
+        with explicit params and a couple of alternates are tried in order.
+        """
+        s = str(start.date())
+        e = str(end.date())
+        urls = [
+            # explicit date params sometimes succeed where the bare id fails
+            f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}&cosd={s}&coed={e}",
+            f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}",
+            # stlouisfed FRED download alternate host
+            f"https://fred.stlouisfed.org/data/{code}.csv",
+        ]
+        for url in urls:
+            try:
+                r = self._pub.get(url, timeout=30)
+                if r.status_code != 200 or "," not in r.text[:200]:
+                    continue
+                df = pd.read_csv(io.StringIO(r.text))
+                if df.shape[1] < 2:
+                    continue
+                df = df.iloc[:, :2]
+                df.columns = ["date", "val"]
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                df["val"] = pd.to_numeric(df["val"].replace(".", np.nan), errors="coerce")
+                out = df.dropna().set_index("date")["val"]
+                out = out.loc[s:e]
+                if len(out):
+                    return out
+            except Exception:
+                continue
+        # last resort: pandas-datareader if installed
         try:
-            r = self._pub.get(url, timeout=30)
-            if r.status_code != 200:
-                return None
-            df = pd.read_csv(io.StringIO(r.text))
-            if df.shape[1] < 2:
-                return None
-            df = df.iloc[:, :2]
-            df.columns = ["date", "val"]
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df["val"] = pd.to_numeric(df["val"].replace(".", np.nan), errors="coerce")
-            df = df.dropna().set_index("date")["val"]
-            return df.loc[str(start.date()):str(end.date())]
+            import pandas_datareader.data as web
+            out = web.DataReader(code, "fred", start, end)[code].dropna()
+            return out if len(out) else None
         except Exception:
             return None
