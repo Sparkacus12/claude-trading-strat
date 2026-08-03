@@ -141,8 +141,8 @@ def dispersion_regime_score(disp: pd.DataFrame, window: int = 504) -> dict:
 # 2. SECTORS (needed for shrinkage + neutralisation)
 # ----------------------------------------------------------------------
 
-def get_sectors() -> pd.Series:
-    """GICS sector per ticker, scraped from the same Wikipedia table."""
+def _sp500_table() -> pd.DataFrame:
+    """Fetch the S&P 500 constituents table once (ticker, name, sector)."""
     import requests
     ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -151,11 +151,31 @@ def get_sectors() -> pd.Series:
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
             headers={"User-Agent": ua}, timeout=30).text
         t = pd.read_html(io.StringIO(html))[0]
-        tick = t["Symbol"].astype(str).str.replace(".", "-", regex=False)
-        sec = t["GICS Sector"].astype(str)
-        return pd.Series(sec.values, index=tick.values, name="sector")
+        t["ticker"] = t["Symbol"].astype(str).str.replace(".", "-", regex=False)
+        return t
     except Exception:
+        return pd.DataFrame()
+
+
+def get_sectors() -> pd.Series:
+    """GICS sector per ticker."""
+    t = _sp500_table()
+    if t.empty or "GICS Sector" not in t.columns:
         return pd.Series(dtype=str, name="sector")
+    return pd.Series(t["GICS Sector"].astype(str).values,
+                     index=t["ticker"].values, name="sector")
+
+
+def get_company_names() -> pd.Series:
+    """
+    Company name per ticker, from the same Wikipedia table (the 'Security'
+    column). Used to show readable names alongside tickers in the app.
+    """
+    t = _sp500_table()
+    if t.empty or "Security" not in t.columns:
+        return pd.Series(dtype=str, name="name")
+    return pd.Series(t["Security"].astype(str).values,
+                     index=t["ticker"].values, name="name")
 
 
 # ----------------------------------------------------------------------
