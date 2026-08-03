@@ -270,3 +270,121 @@ def inverse_vol_weights(prices: pd.DataFrame, tickers: list[str],
             w[t] = avg
         w = w / w.sum()
     return w
+
+
+# ======================================================================
+# 6. PAPER-FAITHFUL IMPROVEMENTS (Carabias 2018)
+# ======================================================================
+
+def estimate_earnings_betas_kalman(sue_panel: pd.DataFrame, bc_q: pd.Series,
+                                   min_obs: int = 8,
+                                   signal_noise: float = 0.05) -> pd.DataFrame:
+    """
+    IMPROVEMENT A - the paper's ACTUAL beta estimator.
+
+    Carabias models firm beta as an unobserved latent state following a
+    random walk (paper, Section 3.2):
+
+        SUE_i,q  = beta_i,q * BC_q + eps        (observation)
+        beta_i,q = beta_i,q-1     + eta         (state, random walk)
+
+    and estimates beta via KALMAN FILTER. Our previous estimator was an
+    exponentially-weighted rolling regression - a reasonable approximation,
+    but the Kalman filter is the correct estimator for a random-walk state:
+    it weights each new observation by its precision rather than by a fixed
+    decay, so it adapts fast when a firm's cyclicality genuinely shifts and
+    stays stable when the data is noisy.
+
+    Crucially the filter is RECURSIVE and forward-only: beta at quarter q
+    uses only data up to q, so every estimate is out-of-sample by
+    construction (paper's point about nowcasts being fully out-of-sample).
+
+    signal_noise = Q/R, the ratio of state variance to observation variance.
+    Higher -> beta moves faster. 0.02-0.10 is a sensible range; 0.05 default.
+    """
+    out = []
+    bc_q = bc_q.dropna()
+
+    for ticker, g in sue_panel.groupby("ticker"):
+        g = g.dropna(subset=["sue"]).sort_values("fiscal_period_end")
+        if len(g) < min_obs:
+            continue
+        m = g.copy()
+        m["bc"] = m["fiscal_period_end"].map(lambda d: _nearest_q_value(bc_q, d))
+        m = m.dropna(subset=["bc", "sue"])
+        if len(m) < min_obs:
+            continue
+
+        y = m["sue"].values.astype(float)
+        xs = m["bc"].values.astype(float)
+        dates = m["fiscal_period_end"].values
+
+        # observation noise from the sample; state noise as a ratio of it
+        R = float(np.var(y)) or 1e-8
+        Q = R * signal_noise
+
+        beta, P = 0.0, R          # diffuse-ish prior
+        for t in range(len(m)):
+            xt, yt = xs[t], y[t]
+            # predict
+            beta_pred, P_pred = beta, P + Q
+            # update
+            S = xt * xt * P_pred + R
+            if S > 0:
+                K = P_pred * xt / S
+                beta = beta_pred + K * (yt - beta_pred * xt)
+                P = (1.0 - K * xt) * P_pred
+            else:
+                beta, P = beta_pred, P_pred
+
+            if t >= min_obs - 1:
+                out.append({"ticker": ticker,
+                            "fiscal_period_end": pd.Timestamp(dates[t]),
+                            "beta_hat": float(beta)})
+
+    return pd.DataFrame(out)
+
+
+def _nearest_q_value(bc_q: pd.Series, d):
+    q_end = pd.Timestamp(d) + pd.offsets.QuarterEnd(0)
+    if q_end in bc_q.index:
+        return bc_q.loc[q_end]
+    prior = bc_q.loc[:q_end]
+    return float(prior.iloc[-1]) if len(prior) else np.nan
+
+
+def attach_lagged_sue(nowcast: pd.DataFrame, sue_panel: pd.DataFrame,
+                      as_of) -> pd.DataFrame:
+    """
+    IMPROVEMENT B - the paper's strongest RETURN-predicting specification.
+
+    Carabias Table 8, column 3 (announcement-window returns):
+
+        CAR = 0.56 * NOWCAST  -  0.17 * SUE_lag1
+                    (t=5.87)          (t=-1.93)
+
+    Both terms matter and they have OPPOSITE signs. The economics (Table 7):
+    investors UNDER-react to the macro information in NOWCAST, and
+    OVER-weight last quarter's realised earnings. So the profitable trade is
+    long high-nowcast AND short high-lagged-SUE - not long nowcast alone.
+
+    We had only implemented the first half. This attaches each name's most
+    recent SUE (as of `as_of`) so the combiner can subtract it.
+    """
+    if nowcast is None or nowcast.empty or sue_panel is None or sue_panel.empty:
+        return nowcast
+
+    s = sue_panel.dropna(subset=["sue"]).copy()
+    s["announcement_date"] = pd.to_datetime(s["announcement_date"])
+    s = s[s["announcement_date"] <= pd.Timestamp(as_of)]
+    if s.empty:
+        return nowcast
+
+    latest = (s.sort_values("announcement_date")
+                .groupby("ticker").tail(1)
+                .set_index("ticker")["sue"])
+
+    df = nowcast.copy()
+    df["sue_lag1"] = df["ticker"].map(latest)
+    df["sue_lag1_pct"] = df["sue_lag1"].rank(pct=True)
+    return df
