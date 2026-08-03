@@ -84,9 +84,10 @@ def load_data(universe_cap: int, hist_years: int):
     return tickers, prices, earnings, macro, sectors, disp, dict(a.diagnostics)
 
 
-if not run:
+if not st.session_state.get("has_run", False):
     st.info("Set options in the sidebar and click **Run / refresh**.")
     st.stop()
+
 
 with st.spinner("Loading data…"):
     tickers, prices, earnings, macro, sectors, disp, diags = load_data(universe_cap, hist_years)
