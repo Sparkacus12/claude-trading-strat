@@ -201,13 +201,30 @@ with tab1:
                 "momentum-orthogonal (MOM loading −0.04).")
     ew = st.slider("Event window (days ahead)", 15, 90, 45, 15, key="nw_win")
     dec = st.slider("Decile fraction", 0.05, 0.30, 0.10, 0.05, key="nw_dec")
+    c1_, c2_ = st.columns(2)
+    min_nm = c1_.number_input("Min names with a signal", 5, 60, 20, 5, key="nw_mn")
+    min_up = c2_.number_input("Min names announcing", 4, 40, 10, 2, key="nw_mu")
     if st.button("Run NOWCAST backtest"):
         with st.spinner("Running…"):
             r = B.backtest_nowcast_faithful(
                 prices, earnings, macro, sectors=sectors,
                 decile_frac=dec, event_window_days=ew,
                 cost_bps=float(bt_cost), beta_shrink=beta_shrink,
-                use_kalman=use_kalman)
+                use_kalman=use_kalman, min_names=int(min_nm),
+                min_upcoming=int(min_up))
+        if r.get("diagnostics"):
+            with st.expander("Why periods were skipped", expanded="error" in r):
+                d = r["diagnostics"]
+                st.write(f"Periods attempted: **{d.get('periods_attempted')}**, "
+                         f"usable: **{d.get('ok')}**")
+                st.write(f"Tickers in earnings calendar: {d.get('tickers_in_calendar')} | "
+                         f"median names with an upcoming announcement: "
+                         f"**{d.get('median_upcoming_names')}**")
+                st.write("Skip reasons:")
+                for k in ["short_price_history", "no_earnings_yet", "no_betas",
+                          "too_few_nowcast", "too_few_upcoming", "leg_return_nan"]:
+                    if d.get(k):
+                        st.write(f"  • {k}: {d[k]}")
         if "error" in r:
             st.error(r["error"])
         else:
