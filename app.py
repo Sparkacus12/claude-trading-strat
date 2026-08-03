@@ -65,6 +65,8 @@ n_buy = st.sidebar.slider("Number of BUYs", 5, 30, 10, 5)
 n_sell = st.sidebar.slider("Number of SELLs", 0, 30, 10, 5)
 
 run = st.sidebar.button("Run / refresh")
+if run:
+    st.session_state["has_run"] = True
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
