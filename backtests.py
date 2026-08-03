@@ -118,7 +118,9 @@ def backtest_nowcast_faithful(prices, earnings, macro,
                               sectors: pd.Series = None,
                               use_kalman: bool = True,
                               start_after_months: int = 24,
-                              apply_filters: bool = True) -> dict:
+                              apply_filters: bool = True,
+                              min_names: int = 20,
+                              min_upcoming: int = 10) -> dict:
     """
     The paper's strategy, as literally as free data allows.
 
@@ -148,14 +150,20 @@ def backtest_nowcast_faithful(prices, earnings, macro,
         return {"error": "Not enough history."}
 
     rows, detail = [], []
+    skips = {"short_price_history": 0, "no_earnings_yet": 0, "no_betas": 0,
+             "too_few_nowcast": 0, "too_few_upcoming": 0, "leg_return_nan": 0,
+             "ok": 0}
+    live_counts = []
 
     for dt in grid[:-1]:
         px_slice = prices.loc[:dt]
         if px_slice.shape[0] < 260:
+            skips["short_price_history"] += 1
             continue
 
         e_slice = earnings[pd.to_datetime(earnings["announcement_date"]) <= dt]
         if e_slice.empty:
+            skips["no_earnings_yet"] += 1
             continue
         bcq_slice = bc_q.loc[:dt]
 
@@ -163,9 +171,11 @@ def backtest_nowcast_faithful(prices, earnings, macro,
         betas = (x.estimate_earnings_betas_kalman(sue, bcq_slice)
                  if use_kalman else e.estimate_earnings_betas(sue, bcq_slice))
         if betas.empty:
+            skips["no_betas"] += 1
             continue
         nc = e.compute_nowcast(betas, bcq_slice, dt)
-        if nc.empty or len(nc) < 20:
+        if nc.empty or len(nc) < min_names:
+            skips["too_few_nowcast"] += 1
             continue
         if beta_shrink > 0:
             nc = x.shrink_betas(nc, sectors, shrink=beta_shrink)
@@ -177,7 +187,9 @@ def backtest_nowcast_faithful(prices, earnings, macro,
         nc["days_to_ann"] = nc["ticker"].apply(
             lambda t: ec.days_to_next_announcement(cal, t, dt))
         live = nc[nc["days_to_ann"].between(0, event_window_days)].copy()
-        if len(live) < 10:
+        live_counts.append(len(live))
+        if len(live) < min_upcoming:
+            skips["too_few_upcoming"] += 1
             continue
 
         live = live.sort_values("nowcast", ascending=False)
@@ -204,7 +216,9 @@ def backtest_nowcast_faithful(prices, earnings, macro,
         lr = leg_return(longs, 1.0)
         sr = leg_return(shorts, -1.0)
         if np.isnan(lr) or np.isnan(sr):
+            skips["leg_return_nan"] += 1
             continue
+        skips["ok"] += 1
 
         gross = 0.5 * lr + 0.5 * sr          # dollar-neutral
         # both legs traded in and out each period
@@ -217,9 +231,14 @@ def backtest_nowcast_faithful(prices, earnings, macro,
                        "longs": ", ".join(longs["ticker"].head(10)),
                        "shorts": ", ".join(shorts["ticker"].head(10))})
 
-    if not rows:
-        return {"error": "No periods produced. Try a larger universe, a longer "
-                         "event window, or more history."}
+    diag = {"periods_attempted": len(grid) - 1, **skips,
+            "median_upcoming_names": (int(np.median(live_counts))
+                                      if live_counts else 0),
+            "tickers_in_calendar": len(cal)}
+
+    if len(rows) < 6:
+        return {"error": f"Only {len(rows)} usable period(s) — not enough for a "
+                         "backtest.", "diagnostics": diag}
 
     bt = pd.DataFrame(rows).set_index("date")
     bt["equity_net"] = (1 + bt["spread_net"]).cumprod()
@@ -235,6 +254,7 @@ def backtest_nowcast_faithful(prices, earnings, macro,
     return {"table": bt, "stats": stats,
             "split": _split(bt["spread_net"]),
             "detail": pd.DataFrame(detail),
+            "diagnostics": diag,
             "note": "Market-NEUTRAL long-short spread. Benchmark is ZERO, not "
                     "the index. Positive Sharpe here means genuine spread "
                     "capture, independent of market direction."}
