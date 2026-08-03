@@ -13,6 +13,7 @@ import engine as e
 import enhancements as x
 import strategy as S
 import earnings_calendar as ec
+import backtests as B
 
 st.set_page_config(page_title="NOWCAST free-data strategy", layout="wide")
 st.title("NOWCAST earnings-revision strategy (free data)")
@@ -79,18 +80,18 @@ def load_data(universe_cap: int, hist_years: int):
     earnings = a.get_earnings(tickers, end - pd.DateOffset(years=hist_years), end,
                               prices=prices)
     sectors = x.get_sectors()
+    names = x.get_company_names()
     disp = x.get_dispersion_series(
         start=str((end - pd.DateOffset(years=hist_years)).date()))
-    return tickers, prices, earnings, macro, sectors, disp, dict(a.diagnostics)
+    return tickers, prices, earnings, macro, sectors, names, disp, dict(a.diagnostics)
 
 
 if not st.session_state.get("has_run", False):
     st.info("Set options in the sidebar and click **Run / refresh**.")
     st.stop()
 
-
 with st.spinner("Loading data…"):
-    tickers, prices, earnings, macro, sectors, disp, diags = load_data(universe_cap, hist_years)
+    tickers, prices, earnings, macro, sectors, names, disp, diags = load_data(universe_cap, hist_years)
 
 with st.expander("Data diagnostics", expanded=False):
     for k in ["universe", "prices", "macro", "earnings"]:
@@ -151,9 +152,15 @@ else:
         w = x.inverse_vol_weights(prices, buys["ticker"].tolist(), as_of=as_of)
         buys["weight"] = buys["ticker"].map(w).fillna(0)
 
-    cols = ["ticker", "combined_score", "nowcast_pct", "momentum_pct", "trend_pct"]
+    # readable company name next to the ticker
+    combo["name"] = combo["ticker"].map(names)
+    buys["name"] = buys["ticker"].map(names)
+    sells = sells.copy()
+    sells["name"] = sells["ticker"].map(names)
+
+    cols = ["ticker", "name", "combined_score", "nowcast_pct", "momentum_pct", "trend_pct"]
     if "sector" in combo.columns:
-        cols.insert(1, "sector")
+        cols.insert(2, "sector")
     if use_event and "days_to_earnings" in combo.columns:
         cols.append("days_to_earnings")
     if "weight" in buys.columns:
@@ -174,44 +181,104 @@ else:
     st.download_button("Download CSV", combo.to_csv(index=False).encode(),
                        "signals.csv", "text/csv")
 
-# ---------------- backtest ----------------
-st.header("Backtest")
-st.caption("Walk-forward, point-in-time (earnings filtered by real SEC filing "
-           "date). **Universe is current index membership — results are "
-           "survivorship-inflated.**")
-n_hold = st.number_input("Holdings", 5, 30, 10, 5)
-cost_bps = st.number_input("Cost per side (bps)", 0, 50, 10, 5)
+# ---------------- backtests: three separate ----------------
+st.header("Backtests")
+st.caption("Three different strategies, three separate tests. **They are not "
+           "comparable to each other**: the long-short spreads are market-neutral "
+           "(benchmark = zero), the combined book is long-only (benchmark = index).")
 
-if st.button("Run backtest"):
-    with st.spinner("Running walk-forward backtest… this takes a few minutes."):
-        res = S.run_backtest(prices, earnings, macro, sectors=sectors,
-                             n_hold=int(n_hold), cost_bps=float(cost_bps),
-                             w_nowcast=w_nc, w_momentum=w_mo, w_trend=w_tr,
-                             use_vol_weights=use_vol_w,
-                             sector_neutral=sector_neutral,
-                             beta_shrink=beta_shrink,
-                             rebalance_mode=mode,
-                             use_event_overlay=use_event,
-                             event_window_days=event_win, w_event=w_event,
-                             use_kalman=use_kalman,
-                             kalman_signal_noise=kalman_sn,
-                             w_sue_lag=w_sue)
-    if "error" in res:
-        st.error(res["error"])
-    else:
-        st.caption(f"Mode: {res['mode']} | annual turnover: {res['annual_turnover']}")
-        st.subheader("Performance")
-        st.dataframe(res["stats"], use_container_width=True)
-        st.subheader("Split-sample test — read this first")
-        st.caption("If the second half is much weaker, the edge is fitted, "
-                   "not predictive.")
-        st.dataframe(res["split"], use_container_width=True)
-        st.subheader("Equity curves")
-        st.line_chart(res["table"][["equity_net", "equity_bench"]]
-                      .rename(columns={"equity_net": "Strategy (net)",
-                                      "equity_bench": "Benchmark (EW)"}))
-        with st.expander("Holdings history"):
-            st.dataframe(res["holdings"], use_container_width=True)
+bt_cost = st.number_input("Cost per side (bps)", 0, 50, 10, 5, key="btcost")
+
+tab1, tab2, tab3 = st.tabs(["1. NOWCAST (faithful long-short)",
+                            "2. Momentum", "3. Combined (long-only)"])
+
+with tab1:
+    st.markdown("**The paper's actual strategy.** Long top decile / short bottom "
+                "decile of NOWCAST among names with an announcement coming up; "
+                "hold each position until just after that name reports. "
+                "Dollar-neutral, so the benchmark is **zero**, not the index. "
+                "Momentum is deliberately excluded — the paper's alpha is "
+                "momentum-orthogonal (MOM loading −0.04).")
+    ew = st.slider("Event window (days ahead)", 15, 90, 45, 15, key="nw_win")
+    dec = st.slider("Decile fraction", 0.05, 0.30, 0.10, 0.05, key="nw_dec")
+    if st.button("Run NOWCAST backtest"):
+        with st.spinner("Running…"):
+            r = B.backtest_nowcast_faithful(
+                prices, earnings, macro, sectors=sectors,
+                decile_frac=dec, event_window_days=ew,
+                cost_bps=float(bt_cost), beta_shrink=beta_shrink,
+                use_kalman=use_kalman)
+        if "error" in r:
+            st.error(r["error"])
+        else:
+            st.info(r["note"])
+            st.dataframe(r["stats"], use_container_width=True)
+            st.subheader("Split-sample test")
+            st.dataframe(r["split"], use_container_width=True)
+            st.line_chart(r["table"][["equity_net"]]
+                          .rename(columns={"equity_net": "Long-short (net)"}))
+            with st.expander("Positions history"):
+                st.dataframe(r["detail"], use_container_width=True)
+
+with tab2:
+    st.markdown("**Canonical 12-1 momentum**, kept separate so its contribution "
+                "is visible on its own.")
+    m_ls = st.radio("Construction", ["Long-short decile", "Long-only top decile"],
+                    key="m_ls")
+    m_dec = st.slider("Decile fraction", 0.05, 0.30, 0.10, 0.05, key="m_dec")
+    if st.button("Run Momentum backtest"):
+        with st.spinner("Running…"):
+            r = B.backtest_momentum(prices, decile_frac=m_dec,
+                                    cost_bps=float(bt_cost),
+                                    long_only=(m_ls == "Long-only top decile"))
+        if "error" in r:
+            st.error(r["error"])
+        else:
+            st.info(r["note"])
+            st.dataframe(r["stats"], use_container_width=True)
+            st.subheader("Split-sample test")
+            st.dataframe(r["split"], use_container_width=True)
+            cols = ["equity_net"] + (["equity_bench"] if m_ls.startswith("Long-only") else [])
+            st.line_chart(r["table"][cols])
+            with st.expander("Positions history"):
+                st.dataframe(r["detail"], use_container_width=True)
+
+with tab3:
+    st.markdown("**The blended long-only book** (nowcast + momentum + trend), "
+                "using the sidebar weights. Benchmark is the equal-weight index. "
+                "Note: blending momentum in mixes the factor the paper's alpha is "
+                "orthogonal to, so a null here doesn't condemn the nowcast signal — "
+                "test that in tab 1.")
+    c_hold = st.number_input("Holdings", 5, 30, 10, 5, key="c_hold")
+    if st.button("Run Combined backtest"):
+        with st.spinner("Running…"):
+            r = B.backtest_combined(
+                prices, earnings, macro, sectors=sectors,
+                n_hold=int(c_hold), cost_bps=float(bt_cost),
+                w_nowcast=w_nc, w_momentum=w_mo, w_trend=w_tr,
+                use_vol_weights=use_vol_w, sector_neutral=sector_neutral,
+                beta_shrink=beta_shrink, rebalance_mode=mode,
+                use_event_overlay=use_event, event_window_days=event_win,
+                w_event=w_event, use_kalman=use_kalman,
+                kalman_signal_noise=kalman_sn, w_sue_lag=w_sue)
+        if "error" in r:
+            st.error(r["error"])
+        else:
+            st.caption(f"Mode: {r['mode']} | annual turnover: {r['annual_turnover']}")
+            st.dataframe(r["stats"], use_container_width=True)
+            st.subheader("Split-sample test")
+            st.dataframe(r["split"], use_container_width=True)
+            st.line_chart(r["table"][["equity_net", "equity_bench"]]
+                          .rename(columns={"equity_net": "Strategy (net)",
+                                          "equity_bench": "Benchmark (EW)"}))
+            with st.expander("Holdings history"):
+                h = r["holdings"].copy()
+                if not h.empty and "holdings" in h.columns:
+                    def _lab(s):
+                        return "; ".join(f"{t} ({names.get(t)})" if isinstance(names.get(t), str) else t
+                                         for t in str(s).split(", "))
+                    h["holdings"] = h["holdings"].apply(_lab)
+                st.dataframe(h, use_container_width=True)
 
 st.markdown("---")
 st.caption("Free data. Survivorship-approximate. A backtest is a hypothesis, "
