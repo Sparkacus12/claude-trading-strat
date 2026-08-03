@@ -34,7 +34,7 @@ st.sidebar.caption("First run pulls and caches data (slow). Later loads use cach
 def load_and_compute(universe_cap: int, hist_years: int):
     a = FreeDataAdapter()
     end = pd.Timestamp.today()
-    start_px = end - pd.DateOffset(years=2)
+    start_px = end - pd.DateOffset(years=hist_years + 1)
     start_hist = end - pd.DateOffset(years=hist_years)
 
     res = {}
