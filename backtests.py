@@ -49,14 +49,35 @@ import earnings_calendar as ec
 # ----------------------------------------------------------------------
 
 def apply_paper_filters(earnings: pd.DataFrame, prices: pd.DataFrame,
-                        calendar_quarters_only: bool = True,
+                        calendar_quarters_only: bool = False,
                         min_price: float = 1.0,
+                        tolerance_days: int = 25,
                         winsorise: float = 0.005) -> pd.DataFrame:
-    """Filters from the paper's sample construction."""
+    """
+    Filters from the paper's sample construction.
+
+    CALENDAR-QUARTER FILTER - HANDLE WITH CARE (this bit bit us).
+    The paper drops firms whose fiscal quarters don't end in Mar/Jun/Sep/Dec.
+    But EDGAR period-end dates rarely fall exactly on a calendar quarter-end:
+    most companies run 13-week fiscal quarters ending on a Saturday, so you
+    see dates like 2023-04-01 or 2023-07-01. Matching on month == [3,6,9,12]
+    therefore throws away most legitimate quarters, leaving too few
+    observations per firm to estimate a beta at all.
+
+    So we match with a TOLERANCE: keep any period end within
+    `tolerance_days` of a calendar quarter-end. Default OFF entirely,
+    because with a small free-data universe the cost in lost firms
+    outweighs the benefit.
+    """
     df = earnings.copy()
     if calendar_quarters_only:
-        m = pd.to_datetime(df["fiscal_period_end"]).dt.month
-        df = df[m.isin([3, 6, 9, 12])]
+        pe = pd.to_datetime(df["fiscal_period_end"])
+        # distance to the nearest calendar quarter-end
+        q_end = pe + pd.offsets.QuarterEnd(0)
+        q_prev = pe - pd.offsets.QuarterEnd(1)
+        dist = pd.concat([(q_end - pe).dt.days.abs(),
+                          (pe - q_prev).dt.days.abs()], axis=1).min(axis=1)
+        df = df[dist <= tolerance_days]
     if min_price and "price_at_period_end" in df.columns:
         df = df[df["price_at_period_end"] >= min_price]
     return df
@@ -110,6 +131,7 @@ def _split(r: pd.Series, ppy: int = 12) -> pd.DataFrame:
 # ======================================================================
 
 def backtest_nowcast_faithful(prices, earnings, macro,
+                              max_names: int = 0,
                               decile_frac: float = 0.10,
                               event_window_days: int = 45,
                               exit_days_after: int = 1,
@@ -135,6 +157,13 @@ def backtest_nowcast_faithful(prices, earnings, macro,
     not the index. Market exposure should be near zero by construction.
     """
     sectors = sectors if sectors is not None else pd.Series(dtype=str)
+    # optional universe cap - the free Streamlit tier has ~1GB, and this
+    # backtest is the heaviest thing in the app. Capping trades breadth for
+    # the ability to finish at all.
+    if max_names and prices.shape[1] > max_names:
+        keep = list(prices.columns[:max_names])
+        prices = prices[keep]
+        earnings = earnings[earnings["ticker"].isin(keep)]
     if apply_filters:
         earnings = apply_paper_filters(earnings, prices)
 
@@ -150,6 +179,7 @@ def backtest_nowcast_faithful(prices, earnings, macro,
         return {"error": "Not enough history."}
 
     rows, detail = [], []
+    _beta_cache: dict = {}
     skips = {"short_price_history": 0, "no_earnings_yet": 0, "no_betas": 0,
              "too_few_nowcast": 0, "too_few_upcoming": 0, "leg_return_nan": 0,
              "ok": 0}
@@ -167,10 +197,19 @@ def backtest_nowcast_faithful(prices, earnings, macro,
             continue
         bcq_slice = bc_q.loc[:dt]
 
-        sue = e.compute_sue(e_slice)
-        betas = (x.estimate_earnings_betas_kalman(sue, bcq_slice)
+        # PERFORMANCE: betas only change when a company FILES, i.e. quarterly.
+        # Recomputing them every month does identical work three times and is
+        # the main memory/CPU cost of this backtest. Cache per quarter.
+        qkey = (dt.year, (dt.month - 1) // 3)
+        if qkey != _beta_cache.get("key"):
+            sue = e.compute_sue(e_slice)
+            b = (x.estimate_earnings_betas_kalman(sue, bcq_slice)
                  if use_kalman else e.estimate_earnings_betas(sue, bcq_slice))
-        if betas.empty:
+            _beta_cache["key"] = qkey
+            _beta_cache["betas"] = b
+            _beta_cache["sue"] = sue
+        betas = _beta_cache.get("betas", pd.DataFrame())
+        if betas is None or betas.empty:
             skips["no_betas"] += 1
             continue
         nc = e.compute_nowcast(betas, bcq_slice, dt)
